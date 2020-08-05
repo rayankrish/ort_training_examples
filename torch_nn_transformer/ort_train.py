@@ -4,10 +4,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchtext
 from torchtext.data.utils import get_tokenizer
+import numpy as np
 
 from pt_model import TransformerModel
 
 from onnxruntime.capi.ort_trainer import IODescription, ModelDescription, ORTTrainer
+from onnxruntime.capi._pybind_state import set_seed
+
+# set the seeds
+torch.manual_seed(0)
+set_seed(0)
 
 # Load and batch data
 TEXT = torchtext.data.Field(tokenize=get_tokenizer("basic_english"),
@@ -53,7 +59,8 @@ dropout = 0.2 # the dropout value
 model = TransformerModel(ntokens, emsize, nhead, nhid, nlayers, dropout).to(device)
 
 # Run the model
-lr = 0.001 # learning rate
+#lr = 0.001 # learning rate
+lr = 0.001
 
 # thiagofc: ORT specific
 def my_loss(x, target):
@@ -64,10 +71,17 @@ def transformer_model_description():
     input_desc = IODescription('input1', [bptt, batch_size], torch.float32)
     label_desc = IODescription('label', [bptt, batch_size, ntokens], torch.int64)
     loss_desc = IODescription('loss', [], torch.float32)
-    return ModelDescription([input_desc, label_desc], [loss_desc]), IODescription('Learning_Rate', [lr,], torch.float32)
+    #return ModelDescription([input_desc, label_desc], [loss_desc]), IODescription('Learning_Rate', [lr,], torch.float32)
+    prediction_desc = IODescription('prediction', [bptt, batch_size, ntokens], torch.float32)
+    return ModelDescription([input_desc, label_desc], [loss_desc, prediction_desc]), IODescription('Learning_Rate', [lr,], torch.float32)
+
 model_desc, lr_desc = transformer_model_description()
 
-trainer = ORTTrainer(model, my_loss, model_desc, "LambOptimizer", None, lr_desc, device)
+def get_lr_this_step(global_step):
+    return 1
+
+trainer = ORTTrainer(model, my_loss, model_desc, "LambOptimizer", None, lr_desc, device, _use_deterministic_compute=True)#, get_lr_this_step=get_lr_this_step)
+second_trainer = ORTTrainer(model, my_loss, model_desc, "LambOptimizer", None, lr_desc, device, _use_deterministic_compute=True)#, get_lr_this_step=get_lr_this_step)
 
 import time
 def train(lr, trainer, data_source, device, epoch):
@@ -82,19 +96,37 @@ def train(lr, trainer, data_source, device, epoch):
             print(f"len(data)={len(data)} < {bptt}")
             continue
         learning_rate = torch.tensor([lr])
-        loss = trainer.train_step(data, targets, learning_rate)
+        #loss, output = trainer.train_step(data, targets)
+        loss, output = trainer.train_step(data, targets, learning_rate)
+        loss, output = second_trainer.train_step(data, targets, learning_rate)
+
+        for (a_name, a_vals), (b_name, b_vals) in zip(trainer.session.get_state().items(), second_trainer.session.get_state().items()):
+            np_a_vals = np.array(a_vals)
+            np_b_vals = np.array(b_vals)
+            #print(np.testing.assert_allclose(np_a_vals, np_b_vals, rtol=1e-4))
+            print(a_name, np.abs(np_a_vals-np_b_vals).max())
+
+
+        # save weights to pickle file
+        import pickle
+        file_name = 'model_run_2.pk'
+        outfile = open(file_name, 'wb')
+        pickle.dump((trainer.session.get_state(), second_trainer.session.get_state()), outfile)
+        outfile.close()
+        break
         # import pdb; pdb.set_trace()
         total_loss += loss.item()
-        log_interval = 200
+        log_interval = 20
         if batch % log_interval == 0 and batch > 0:
             cur_loss = total_loss / log_interval
             elapsed = time.time() - start_time
             print('| {} | epoch {:3d} | {:5d}/{:5d} batches | '
                   'lr {:02.3f} | ms/batch {:5.2f} | '
-                  'loss {:5.2f} | ppl {:8.2f}'.format(
+                  'loss {:5.2f} | ppl {:8.2f} |'.format(
                     device, epoch, batch, len(data_source) // bptt, lr,
                     elapsed * 1000 / log_interval,
                     cur_loss, math.exp(cur_loss)))
+            print('| torch loss {:5.2f} |'.format(trainer.get_torch_cur_loss()))
             total_loss = 0
             start_time = time.time()
 
@@ -107,7 +139,7 @@ def evaluate(trainer, data_source):
                 print(f"len(data)={len(data)} < {bptt}")
                 continue
             # import pdb; pdb.set_trace()
-            loss = trainer.eval_step(data, targets)
+            loss = trainer.eval_step(data, targets, fetches=["loss"])
             total_loss += len(data) * loss.item()
     return total_loss / (len(data_source) - 1)
 
